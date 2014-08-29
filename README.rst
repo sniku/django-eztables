@@ -53,6 +53,7 @@ Features
     - sorting (single and multi columns)
     - filtering with regex support (global and by column)
     - formatting using format pattern
+    - supporting custom method functions
 - Deferred loading support.
 - Twitter Bootstrap integration.
 

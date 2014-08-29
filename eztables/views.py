@@ -4,6 +4,7 @@ import json
 import re
 
 from operator import or_
+import datetime
 
 from django.core.paginator import Paginator
 from django.core.serializers.json import DjangoJSONEncoder
@@ -48,6 +49,17 @@ def get_real_field(model, field_name):
         raise Exception('Unhandled field: %s' % field_name)
 
 
+def get_field_value(db_obj, field_name):
+    parts = field_name.split('__')
+
+    if len(parts) == 1:
+        return unicode(getattr(db_obj, field_name))
+    else:
+        field = getattr(db_obj, parts[0])
+        return get_field_value(field, '__'.join(parts[1:]))
+
+
+
 class DatatablesView(MultipleObjectMixin, View):
     '''
     Render a paginated server-side Datatables JSON view.
@@ -56,6 +68,7 @@ class DatatablesView(MultipleObjectMixin, View):
     '''
     fields = []
     _db_fields = None
+    _f_fields = []
 
     def post(self, request, *args, **kwargs):
         return self.process_dt_response(request.POST)
@@ -64,12 +77,36 @@ class DatatablesView(MultipleObjectMixin, View):
         return self.process_dt_response(request.GET)
 
     def process_dt_response(self, data):
+
         self.form = DatatablesForm(data)
         if self.form.is_valid():
-            self.object_list = self.get_queryset().values(*self.get_db_fields())
+            self.object_list = self.get_queryset()
+
             return self.render_to_response(self.form)
         else:
             return HttpResponseBadRequest()
+
+    def process_objects(self, object_list):
+        fields = self.get_db_fields()
+        db_fields = set(self._db_fields)
+        f_fields  = set(self._f_fields)
+
+        for i, x in enumerate(object_list):
+            o = {}
+            fields = self.fields if isinstance(self.fields, dict) else dict(zip(self.fields, self.fields))
+            for name, value in fields.iteritems():
+                if value in f_fields:
+                    o[name] = getattr(x, value)()
+                elif '__' in value:
+                    o[name] = get_field_value(x, value)
+                elif value in db_fields:
+                    o[name] = unicode(getattr(x, value))
+                elif RE_FORMATTED.match(value):
+                    o[name] = unicode(value).format(**x.__dict__)
+                else:
+                    raise Exception("What's '{0}':'{1}'".format(name, value))
+
+        return object_list
 
     def get_db_fields(self):
         if not self._db_fields:
@@ -78,6 +115,8 @@ class DatatablesView(MultipleObjectMixin, View):
             for field in fields:
                 if RE_FORMATTED.match(field):
                     self._db_fields.extend(RE_FORMATTED.findall(field))
+                elif hasattr(self.model, field):
+                    self._f_fields.append(field)
                 else:
                     self._db_fields.append(field)
         return self._db_fields
@@ -88,6 +127,9 @@ class DatatablesView(MultipleObjectMixin, View):
 
     def get_field(self, index):
         if isinstance(self.fields, dict):
+            dt_data = self.dt_data
+            i = 'mDataProp_%s' % index
+            f = self.fields
             return self.fields[self.dt_data['mDataProp_%s' % index]]
         else:
             return self.fields[index]
@@ -107,7 +149,16 @@ class DatatablesView(MultipleObjectMixin, View):
         dt_orders = [(self.dt_data['iSortCol_%s' % i], self.dt_data['sSortDir_%s' % i]) for i in xrange(iSortingCols)]
         for field_idx, field_dir in dt_orders:
             direction = '-' if field_dir == DESC else ''
-            if hasattr(self, 'sort_col_%s' % field_idx):
+            field = self.get_field(field_idx)
+
+            if hasattr(self, 'sort_col_%s' % field):
+                method = getattr(self, 'sort_col_%s' % field)
+                result = method(direction)
+                if isinstance(result, (bytes, text_type)):
+                    orders.append(result)
+                else:
+                    orders.extend(result)
+            elif hasattr(self, 'sort_col_%s' % field_idx):
                 method = getattr(self, 'sort_col_%s' % field_idx)
                 result = method(direction)
                 if isinstance(result, (bytes, text_type)):
@@ -115,7 +166,6 @@ class DatatablesView(MultipleObjectMixin, View):
                 else:
                     orders.extend(result)
             else:
-                field = self.get_field(field_idx)
                 if RE_FORMATTED.match(field):
                     tokens = RE_FORMATTED.findall(field)
                     orders.extend(['%s%s' % (direction, token) for token in tokens])
@@ -128,11 +178,7 @@ class DatatablesView(MultipleObjectMixin, View):
         search = self.dt_data['sSearch']
         if search:
             if self.dt_data['bRegex']:
-                criterions = [
-                    Q(**{'%s__iregex' % field: search})
-                    for field in self.get_db_fields()
-                    if self.can_regex(field)
-                ]
+                criterions = [Q(**{'%s__iregex' % field: search}) for field in self.get_db_fields() if self.can_regex(field)]
                 if len(criterions) > 0:
                     search = reduce(or_, criterions)
                     queryset = queryset.filter(search)
@@ -148,11 +194,14 @@ class DatatablesView(MultipleObjectMixin, View):
         for idx in xrange(self.dt_data['iColumns']):
             search = self.dt_data['sSearch_%s' % idx]
             if search:
-                if hasattr(self, 'search_col_%s' % idx):
+                field = self.get_field(idx)
+                if hasattr(self, 'search_col_%s' % field):
+                    custom_search = getattr(self, 'search_col_%s' % field)
+                    queryset = custom_search(search, queryset)
+                elif hasattr(self, 'search_col_%s' % idx):
                     custom_search = getattr(self, 'search_col_%s' % idx)
                     queryset = custom_search(search, queryset)
                 else:
-                    field = self.get_field(idx)
                     fields = RE_FORMATTED.findall(field) if RE_FORMATTED.match(field) else [field]
                     if self.dt_data['bRegex_%s' % idx]:
                         criterions = [Q(**{'%s__iregex' % field: search}) for field in fields if self.can_regex(field)]
@@ -188,22 +237,46 @@ class DatatablesView(MultipleObjectMixin, View):
         '''Format all rows'''
         return [self.get_row(row) for row in rows]
 
-    def get_row(self, row):
+    def get_row(self, db_object):
         '''Format a single row (if necessary)'''
 
+        row = db_object
+
+        if isinstance(row, models.Model):
+            db_fields = set(self._db_fields)
+            f_fields  = set(self._f_fields)
+
+            o = {}
+            fields = self.fields if isinstance(self.fields, dict) else dict(zip(self.fields, self.fields))
+            for name, value in fields.iteritems():
+                if value in f_fields:
+                    o[name] = getattr(row, value)()
+                elif '__' in value:
+                    o[name] = unicode(get_field_value(row, value))
+                elif value in db_fields:
+                    o[name] = unicode(getattr(row, value))
+                elif RE_FORMATTED.match(value):
+                    o[name] = unicode(value).format(**row.__dict__)
+                else:
+                    raise Exception("What's '{0}':'{1}'".format(name, value))
+            row = o
+
         if isinstance(self.fields, dict):
+
             return dict([
-                (key, text_type(value).format(**row) if RE_FORMATTED.match(value) else row[value])
+                (key,  row[key])
                 for key, value in self.fields.items()
             ])
         else:
-            return [text_type(field).format(**row) if RE_FORMATTED.match(field)
+            return [text_type(field).format(**db_object.__dict__) if RE_FORMATTED.match(field)
                     else row[field]
                     for field in self.fields]
 
     def render_to_response(self, form, **kwargs):
         '''Render Datatables expected JSON format'''
         page = self.get_page(form)
+        page = self.process_objects(page)
+
         data = {
             'iTotalRecords': page.paginator.count,
             'iTotalDisplayRecords': page.paginator.count,
@@ -213,6 +286,7 @@ class DatatablesView(MultipleObjectMixin, View):
         return self.json_response(data)
 
     def json_response(self, data):
+
         return HttpResponse(
             json.dumps(data, cls=DjangoJSONEncoder),
             content_type=JSON_MIMETYPE
